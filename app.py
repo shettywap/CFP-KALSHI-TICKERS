@@ -203,7 +203,7 @@ st.set_page_config(
 st.title("🏈 CFP Playoff Odds Tracker (Kalshi API)")
 st.caption(
     "Read-only Streamlit app tracking the **College Football Playoff Qualifiers** market "
-    f"(`{CFP_EVENT_TICKER}`) on Kalshi. No orders, no money — just data."
+    f"(`{CFP_EVENT_TICKER}`) on Kalshi."
 )
 
 # Sidebar controls
