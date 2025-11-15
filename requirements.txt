@@ -1,4 +1,5 @@
 streamlit
-requests
-cryptography
+google-cloud-firestore
+google-auth
 pandas
+streamlit-autorefresh
