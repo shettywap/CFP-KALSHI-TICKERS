@@ -15,7 +15,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 #  CONFIG / ENV VARS
 # ===========================
 
-# Set these in your environment (or Streamlit Cloud secrets):
+# Set these in Streamlit Cloud "Secrets":
 #
 #   KALSHI_API_KEY_ID       = your Kalshi API key ID
 #   KALSHI_PRIVATE_KEY_PEM  = your *multi-line* RSA private key in PEM format
@@ -241,11 +241,16 @@ if "last_refresh_ts" not in st.session_state:
 # ========== DATA FETCH ==========
 
 def refresh_data():
+    """
+    Fetch markets, build rows + movers.
+    Always returns (rows, movers), even on error.
+    """
     try:
         markets = fetch_cfp_markets()
     except Exception as e:
         st.error(f"Error fetching CFP markets: {e}")
-        return
+        # On error, return safe empty values so unpacking works
+        return [], []
 
     rows = summarize_cfp_markets(markets)
 
@@ -293,13 +298,13 @@ with col_ts:
     else:
         st.write("Last refresh: _pending_")
 
-# If we just refreshed, we got rows/movers. If not, we may want to
-# recompute rows from current markets for display only.
+# If we just refreshed, we got rows/movers.
+# If not, recompute rows from current markets for display only.
 if rows is None:
     try:
         markets = fetch_cfp_markets()
         rows = summarize_cfp_markets(markets)
-        # no movers recomputed here; ticker tape only updates on explicit refresh
+        # No movers recomputed here; ticker tape only updates on explicit refresh
     except Exception as e:
         st.error(f"Error fetching CFP markets: {e}")
         rows = []
@@ -315,7 +320,8 @@ tab_table, tab_movers, tab_tape = st.tabs(
 with tab_table:
     st.subheader("All CFP Playoff Qualifier Markets")
     st.caption(
-        f"Event: `{CFP_EVENT_TICKER}` • Source: Kalshi `/markets?event_ticker={CFP_EVENT_TICKER}`"
+        f"Event: `{CFP_EVENT_TICKER}` • "
+        f"Source: Kalshi `/markets?event_ticker={CFP_EVENT_TICKER}`"
     )
     if rows:
         st.dataframe(
@@ -330,14 +336,13 @@ with tab_table:
 with tab_movers:
     st.subheader(f"Movers ≥ {min_move} pts since last refresh")
     if movers is None:
-        # If app just loaded and we didn't compute movers yet
         st.info("Hit **Refresh now** to compute movers.")
     else:
         if movers:
-            # Color-coded dataframe
             import pandas as pd
 
             df = pd.DataFrame(movers)
+
             def color_diff(val):
                 if val > 0:
                     return "color: green;"
@@ -362,11 +367,16 @@ with tab_tape:
     if st.session_state.cfp_tape:
         # Show most recent first
         for line in reversed(st.session_state.cfp_tape[-200:]):
-            # Simple inline color
             if "UP" in line:
-                st.markdown(f"<span style='color:limegreen;'>{line}</span>", unsafe_allow_html=True)
+                st.markdown(
+                    f"<span style='color:limegreen;'>{line}</span>",
+                    unsafe_allow_html=True,
+                )
             elif "DOWN" in line:
-                st.markdown(f"<span style='color:#ff4b4b;'>{line}</span>", unsafe_allow_html=True)
+                st.markdown(
+                    f"<span style='color:#ff4b4b;'>{line}</span>",
+                    unsafe_allow_html=True,
+                )
             else:
                 st.write(line)
     else:
