@@ -2,7 +2,6 @@ import os
 import time
 import json
 import base64
-from urllib.parse import urlparse, urljoin
 from datetime import datetime
 
 import requests
@@ -24,10 +23,10 @@ from cryptography.hazmat.primitives.asymmetric import padding
 API_KEY_ID = os.getenv("KALSHI_API_KEY_ID")
 PRIVATE_KEY_PEM = os.getenv("KALSHI_PRIVATE_KEY_PEM")
 
-# *** CORRECT TRADING API BASE URL ***
+# ✅ OFFICIAL API BASE (supports all markets, auth etc.)
 BASE_URL = os.getenv(
     "KALSHI_BASE_URL",
-    "https://api.kalshi.com/trade-api/v2",   # <-- fixed here
+    "https://api.elections.kalshi.com/trade-api/v2",
 )
 
 # College Football Playoff Qualifiers event ticker
@@ -41,7 +40,7 @@ CFP_EVENT_TICKER = "KXNCAAFPLAYOFF-25"
 @st.cache_resource
 def _load_private_key():
     if not PRIVATE_KEY_PEM:
-        raise RuntimeError("KALSHI_PRIVATE_KEY_PEM is not set.")
+        raise RuntimeError("KALSHI_PRIVATE_KEY_PEM is not set in environment.")
     return serialization.load_pem_private_key(
         PRIVATE_KEY_PEM.encode("utf-8"),
         password=None,
@@ -64,21 +63,27 @@ def _sign_message(private_key, message: str) -> str:
 def kalshi_signed_get(path: str):
     """
     Send a signed GET request to Kalshi.
-    `path` must start with '/'.
+
+    `path` MUST start with '/', e.g.:
+      "/markets?event_ticker=KXNCAAFPLAYOFF-25&limit=1000"
     """
     if not API_KEY_ID:
-        raise RuntimeError("KALSHI_API_KEY_ID is not set.")
+        raise RuntimeError("KALSHI_API_KEY_ID is not set in environment.")
 
     private_key = _load_private_key()
 
-    # Full URL
-    url = urljoin(BASE_URL, path.lstrip("/"))
+    # Build full URL: keep /trade-api/v2 and append path
+    base = BASE_URL.rstrip("/")
+    if not path.startswith("/"):
+        path = "/" + path
+    url = base + path  # e.g. https://api.elections.kalshi.com/trade-api/v2/markets?...
 
-    # Sign: timestamp + METHOD + PATH (INCLUDE leading slash)
+    # Per docs: sign timestamp + METHOD + PATH (including /trade-api/v2 prefix)
+    from urllib.parse import urlparse
     parsed = urlparse(url)
     method = "GET"
     timestamp = str(int(time.time() * 1000))
-    message = timestamp + method + parsed.path
+    message = timestamp + method + parsed.path  # e.g. "/trade-api/v2/markets"
 
     signature = _sign_message(private_key, message)
 
@@ -118,7 +123,7 @@ def kalshi_get_json(path: str):
 # ===========================
 
 def fetch_cfp_markets():
-    """Fetch all CFP qualifier markets."""
+    """Fetch all CFP qualifier markets for the event."""
     data = kalshi_get_json(
         f"/markets?event_ticker={CFP_EVENT_TICKER}&limit=1000"
     )
@@ -190,7 +195,8 @@ st.set_page_config(
 
 st.title("🏈 CFP Playoff Odds Tracker (Kalshi API)")
 st.caption(
-    "Live CFP qualifier odds from Kalshi. Read-only — no orders, no money."
+    "Live College Football Playoff qualifier odds from Kalshi. "
+    "Read-only — no orders, no money."
 )
 
 # Sidebar
@@ -266,8 +272,8 @@ if rows is None:
     try:
         markets = fetch_cfp_markets()
         rows = summarize_cfp_markets(markets)
-    except:
-        rows = []
+    except Exception:
+        rows, movers = [], []
 
 
 # ===========================
@@ -290,7 +296,7 @@ with tab1:
 
 # ---- Tab 2 ----
 with tab2:
-    st.subheader(f"Movers ≥ {min_move} points")
+    st.subheader(f"Movers ≥ {min_move} points (since last refresh)")
     if movers:
         import pandas as pd
         df = pd.DataFrame(movers)
@@ -307,3 +313,9 @@ with tab3:
             st.markdown(f"<span style='color:{color}'>{line}</span>", unsafe_allow_html=True)
     else:
         st.write("No movements logged yet.")
+
+st.markdown(
+    "---\n"
+    "_This app is read-only and only uses Kalshi GET endpoints. "
+    "It does not place, cancel, or modify any orders._"
+)
