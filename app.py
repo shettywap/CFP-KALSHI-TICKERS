@@ -1,321 +1,189 @@
-import os
-import time
-import json
-import base64
-from datetime import datetime
-
-import requests
 import streamlit as st
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding
+import pandas as pd
+from google.oauth2 import service_account
+from google.cloud import firestore
+from streamlit_autorefresh import st_autorefresh
 
-
-# ===========================
-#  CONFIG / ENV VARS
-# ===========================
-
-# Set these in Streamlit Cloud "Secrets":
-#
-#   KALSHI_API_KEY_ID       = your Kalshi API key ID
-#   KALSHI_PRIVATE_KEY_PEM  = your *multi-line* RSA private key in PEM format
-#
-
-API_KEY_ID = os.getenv("KALSHI_API_KEY_ID")
-PRIVATE_KEY_PEM = os.getenv("KALSHI_PRIVATE_KEY_PEM")
-
-# ✅ OFFICIAL API BASE (supports all markets, auth etc.)
-BASE_URL = os.getenv(
-    "KALSHI_BASE_URL",
-    "https://api.elections.kalshi.com/trade-api/v2",
-)
-
-# College Football Playoff Qualifiers event ticker
-CFP_EVENT_TICKER = "KXNCAAFPLAYOFF-25"
-
-
-# ===========================
-#  SIGNING HELPERS
-# ===========================
-
-@st.cache_resource
-def _load_private_key():
-    if not PRIVATE_KEY_PEM:
-        raise RuntimeError("KALSHI_PRIVATE_KEY_PEM is not set in environment.")
-    return serialization.load_pem_private_key(
-        PRIVATE_KEY_PEM.encode("utf-8"),
-        password=None,
-    )
-
-
-def _sign_message(private_key, message: str) -> str:
-    """Sign message using RSA-PSS SHA256, return base64 string."""
-    signature = private_key.sign(
-        message.encode("utf-8"),
-        padding.PSS(
-            mgf=padding.MGF1(hashes.SHA256()),
-            salt_length=padding.PSS.MAX_LENGTH,
-        ),
-        hashes.SHA256(),
-    )
-    return base64.b64encode(signature).decode("utf-8")
-
-
-def kalshi_signed_get(path: str):
-    """
-    Send a signed GET request to Kalshi.
-
-    `path` MUST start with '/', e.g.:
-      "/markets?event_ticker=KXNCAAFPLAYOFF-25&limit=1000"
-    """
-    if not API_KEY_ID:
-        raise RuntimeError("KALSHI_API_KEY_ID is not set in environment.")
-
-    private_key = _load_private_key()
-
-    # Build full URL: keep /trade-api/v2 and append path
-    base = BASE_URL.rstrip("/")
-    if not path.startswith("/"):
-        path = "/" + path
-    url = base + path  # e.g. https://api.elections.kalshi.com/trade-api/v2/markets?...
-
-    # Per docs: sign timestamp + METHOD + PATH (including /trade-api/v2 prefix)
-    from urllib.parse import urlparse
-    parsed = urlparse(url)
-    method = "GET"
-    timestamp = str(int(time.time() * 1000))
-    message = timestamp + method + parsed.path  # e.g. "/trade-api/v2/markets"
-
-    signature = _sign_message(private_key, message)
-
-    headers = {
-        "KALSHI-ACCESS-KEY": API_KEY_ID,
-        "KALSHI-ACCESS-TIMESTAMP": timestamp,
-        "KALSHI-ACCESS-SIGNATURE": signature,
-        "Content-Type": "application/json",
-    }
-
-    resp = requests.get(url, headers=headers, timeout=10)
-    return resp
-
-
-def kalshi_get_json(path: str):
-    """GET JSON or raise descriptive error."""
-    resp = kalshi_signed_get(path)
-
-    try:
-        data = resp.json()
-    except json.JSONDecodeError:
-        raise RuntimeError(
-            f"Non-JSON response ({resp.status_code}): {resp.text[:200]}"
-        )
-
-    if resp.status_code != 200:
-        raise RuntimeError(
-            f"Kalshi returned {resp.status_code} for {path}:\n"
-            + json.dumps(data, indent=2)
-        )
-
-    return data
-
-
-# ===========================
-#  CFP MARKET HELPERS
-# ===========================
-
-def fetch_cfp_markets():
-    """Fetch all CFP qualifier markets for the event."""
-    data = kalshi_get_json(
-        f"/markets?event_ticker={CFP_EVENT_TICKER}&limit=1000"
-    )
-    markets = data.get("markets", [])
-
-    # Sort by YES price desc
-    def sort_key(m):
-        yp = m.get("yes_price")
-        return -(yp if yp is not None else -1)
-
-    return sorted(markets, key=sort_key)
-
-
-def summarize_cfp_markets(markets):
-    rows = []
-    for m in markets:
-        rows.append(
-            {
-                "Team": m.get("title", m.get("ticker")),
-                "Ticker": m.get("ticker"),
-                "YES": m.get("yes_price"),
-                "NO": m.get("no_price"),
-                "Volume": m.get("volume"),
-            }
-        )
-    return rows
-
-
-def compute_movers(rows, prev_prices, threshold):
-    movers = []
-    new_prices = {}
-
-    for row in rows:
-        ticker = row["Ticker"]
-        price = row["YES"]
-        if price is None:
-            continue
-
-        new_prices[ticker] = price
-
-        prev = prev_prices.get(ticker)
-        if prev is None:
-            continue
-
-        diff = price - prev
-        if abs(diff) >= threshold:
-            movers.append(
-                {
-                    "Team": row["Team"],
-                    "Ticker": ticker,
-                    "Prev": prev,
-                    "Now": price,
-                    "Diff": diff,
-                }
-            )
-
-    return movers, new_prices
-
-
-# ===========================
-#  STREAMLIT UI
-# ===========================
-
+# -------------------------
+# PAGE CONFIG
+# -------------------------
 st.set_page_config(
-    page_title="CFP Playoff Odds Tracker",
-    page_icon="🏈",
+    page_title="CFP Playoff Odds Ticker",
     layout="wide",
 )
 
-st.title("🏈 CFP Playoff Odds Tracker (Kalshi API)")
-st.caption(
-    "Live College Football Playoff qualifier odds from Kalshi. "
-    "Read-only — no orders, no money."
-)
+# -------------------------
+# FIRESTORE CLIENT (uses st.secrets, NO local file required)
+# -------------------------
+@st.cache_resource
+def get_db():
+    creds_dict = st.secrets["firebase"]  # loaded from Streamlit Cloud secrets
+    creds = service_account.Credentials.from_service_account_info(creds_dict)
+    return firestore.Client(credentials=creds, project=creds_dict["project_id"])
 
-# Sidebar
-st.sidebar.header("Settings")
-min_move = st.sidebar.slider(
-    "Minimum movement to log (points)", 1, 20, 2
-)
+db = get_db()
 
-# Session state
-if "prev_prices" not in st.session_state:
-    st.session_state.prev_prices = {}
-if "tape" not in st.session_state:
-    st.session_state.tape = []
-if "last_refresh" not in st.session_state:
-    st.session_state.last_refresh = None
+# -------------------------
+# AUTO REFRESH EVERY 5s
+# -------------------------
+st_autorefresh(interval=5000, key="cfp_ticker_refresh")
 
+# -------------------------
+# HELPERS
+# -------------------------
+def format_ticker(ticker: str) -> str:
+    if not ticker:
+        return ""
+    return ticker.split("-")[-1]
 
-# ===========================
-#  REFRESH LOGIC
-# ===========================
-
-def refresh_data():
-    """Always return (rows, movers) even on failure."""
-    try:
-        markets = fetch_cfp_markets()
-    except Exception as e:
-        st.error(f"Error fetching markets: {e}")
-        return [], []
-
-    rows = summarize_cfp_markets(markets)
-    movers, new_prices = compute_movers(rows, st.session_state.prev_prices, min_move)
-
-    # Save new prices
-    st.session_state.prev_prices = new_prices
-    st.session_state.last_refresh = datetime.utcnow().strftime("%H:%M:%S UTC")
-
-    # Append movers to tape
-    now_str = datetime.utcnow().strftime("%H:%M:%S")
-    for m in movers:
-        sign = "+" if m["Diff"] > 0 else ""
-        line = (
-            f"[{now_str}] {m['Ticker']} {m['Team']} "
-            f"{m['Prev']} → {m['Now']} ({sign}{m['Diff']})"
-        )
-        st.session_state.tape.append(line)
-
-    return rows, movers
+def format_prob(prob):
+    if prob is None:
+        return "--"
+    return f"{prob * 100:.1f}%"
 
 
-# ===========================
-#  REFRESH BUTTON
-# ===========================
+# -------------------------
+# FETCH DATA FROM FIRESTORE
+# -------------------------
+doc_ref = db.collection("cfp_markets").document("current")
+doc = doc_ref.get()
 
-col1, col2 = st.columns([1, 4])
-with col1:
-    if st.button("🔄 Refresh Now"):
-        rows, movers = refresh_data()
-    else:
-        if st.session_state.last_refresh is None:
-            rows, movers = refresh_data()
-        else:
-            rows, movers = None, None
+if not doc.exists:
+    st.error("No Firestore document at cfp_markets/current yet.")
+    st.stop()
 
-with col2:
-    if st.session_state.last_refresh:
-        st.write(f"Last Refresh: **{st.session_state.last_refresh}**")
-    else:
-        st.write("Last Refresh: pending")
+data = doc.to_dict()
+markets = data.get("markets", [])
 
+df = pd.DataFrame(markets)
 
-# If no new refresh, load rows for table
-if rows is None:
-    try:
-        markets = fetch_cfp_markets()
-        rows = summarize_cfp_markets(markets)
-    except Exception:
-        rows, movers = [], []
+if df.empty:
+    st.warning("Markets array is empty in cfp_markets/current.")
+    st.stop()
+
+df = df.sort_values(by="probability", ascending=False, na_position="last")
 
 
-# ===========================
-#  TABS
-# ===========================
+# cache previous probabilities to flash on change
+if "prev_probs" not in st.session_state:
+    st.session_state.prev_probs = {}
 
-tab1, tab2, tab3 = st.tabs([
-    "📋 Full Market Table",
-    "📈 Movers",
-    "📜 Ticker Tape",
-])
-
-# ---- Tab 1 ----
-with tab1:
-    st.subheader("All CFP Qualifier Markets")
-    if rows:
-        st.dataframe(rows, use_container_width=True)
-    else:
-        st.write("No markets returned.")
-
-# ---- Tab 2 ----
-with tab2:
-    st.subheader(f"Movers ≥ {min_move} points (since last refresh)")
-    if movers:
-        import pandas as pd
-        df = pd.DataFrame(movers)
-        st.dataframe(df, use_container_width=True)
-    else:
-        st.write("No movers since last refresh.")
-
-# ---- Tab 3 ----
-with tab3:
-    st.subheader("Ticker Tape Log")
-    if st.session_state.tape:
-        for line in reversed(st.session_state.tape[-200:]):
-            color = "limegreen" if "+" in line else "#ff4b4b"
-            st.markdown(f"<span style='color:{color}'>{line}</span>", unsafe_allow_html=True)
-    else:
-        st.write("No movements logged yet.")
-
+# -------------------------
+# CSS
+# -------------------------
 st.markdown(
-    "---\n"
-    "_This app is read-only and only uses Kalshi GET endpoints. "
-    "It does not place, cancel, or modify any orders._"
+    """
+<style>
+body {
+    background: radial-gradient(circle at top, #0f172a, #020617 60%);
+}
+
+.main {
+    padding-top: 1rem;
+}
+
+.ticker-container {
+    width: 100%;
+    overflow: hidden;
+    white-space: nowrap;
+    background: #020617;
+    border-radius: 18px;
+    padding: 12px 0;
+    border: 1px solid rgba(148, 163, 184, 0.5);
+    box-shadow: 0 18px 35px rgba(15, 23, 42, 0.85);
+}
+
+.ticker-track {
+    display: inline-block;
+    animation: ticker-scroll 35s linear infinite;
+}
+
+@keyframes ticker-scroll {
+    from { transform: translateX(0%); }
+    to { transform: translateX(-50%); }
+}
+
+.ticker-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin: 0 24px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    background: rgba(15, 23, 42, 0.95);
+    box-shadow: 0 0 0 1px rgba(148, 163, 184, 0.45);
+    font-size: 0.95rem;
+    color: #e5e7eb;
+}
+
+.ticker-team {
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-weight: 600;
+}
+
+.ticker-prob {
+    font-variant-numeric: tabular-nums;
+    color: #a5b4fc;
+}
+
+.flash {
+    color: #22c55e !important;
+    text-shadow: 0 0 10px rgba(34, 197, 94, 0.8);
+}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+# -------------------------
+# BUILD TICKER HTML
+# -------------------------
+ticker_html = '<div class="ticker-container"><div class="ticker-track">'
+
+for _, row in df.iterrows():
+    team = format_ticker(row.get("ticker"))
+    prob = row.get("probability")
+    prev = st.session_state.prev_probs.get(row["ticker"])
+
+    flash_class = ""
+    if prev is not None and prev != prob:
+        flash_class = "flash"
+
+    prob_text = format_prob(prob)
+    ticker_html += (
+        f'<span class="ticker-item {flash_class}">'
+        f'<span class="ticker-team">{team}</span>'
+        f'<span class="ticker-prob">{prob_text}</span>'
+        f"</span>"
+    )
+
+# duplicate list for endless scroll
+ticker_html += ticker_html
+ticker_html += "</div></div>"
+
+# update prev probabilities for next refresh
+st.session_state.prev_probs = {
+    r["ticker"]: r["probability"] for _, r in df.iterrows()
+}
+
+# -------------------------
+# LAYOUT
+# -------------------------
+st.title("🏈 CFP Playoff Odds — Live Ticker")
+st.caption("Live probabilities from Kalshi, synced via Firestore.")
+
+st.markdown("### Live Ticker")
+st.markdown(ticker_html, unsafe_allow_html=True)
+
+st.markdown("### All Teams")
+display_df = df.copy()
+display_df["team"] = display_df["ticker"].apply(format_ticker)
+display_df["probability (%)"] = display_df["probability"].apply(
+    lambda x: None if x is None else round(x * 100, 1)
+)
+
+st.dataframe(
+    display_df[["team", "ticker", "probability (%)", "last_price", "best_bid", "best_ask"]],
+    hide_index=True,
 )
