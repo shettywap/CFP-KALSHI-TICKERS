@@ -1,4 +1,5 @@
 import datetime
+from zoneinfo import ZoneInfo  # <-- NEW: for proper timezone conversion
 
 import pandas as pd
 import streamlit as st
@@ -33,12 +34,10 @@ db = get_db()
 # -------------------------
 # MANUAL + AUTO REFRESH
 # -------------------------
-# Manual button
 st.markdown("### 🔄 Refresh Data")
 if st.button("Refresh Now"):
     st.experimental_rerun()
 
-# Auto-refresh every 5 seconds
 st_autorefresh(interval=5000, key="auto_refresh_cfp")
 
 
@@ -63,7 +62,7 @@ def delta_text(delta: float | None) -> str:
     if delta == 0:
         return "0.0%"
     sign = "+" if delta > 0 else ""
-    return f"{sign}{delta * 100:.1f}%"  # delta is still 0–1 scale
+    return f"{sign}{delta * 100:.1f}%"  # delta still 0–1 scale
 
 
 def prob_pct(prob: float | None) -> float | None:
@@ -73,25 +72,36 @@ def prob_pct(prob: float | None) -> float | None:
 
 
 def pretty_time(ts: str) -> str:
-    """Convert ISO timestamp to a human-readable string."""
+    """
+    Convert an ISO UTC timestamp string to America/New_York local time
+    and format it nicely (e.g. '7:32 PM', 'Sat 7:32 PM', 'Nov 15, 7:32 PM').
+    """
     try:
-        dt = datetime.datetime.fromisoformat(ts.replace("Z", ""))
+        # Treat incoming timestamp as UTC
+        # handle "...Z" and plain ISO without timezone
+        if ts.endswith("Z"):
+            dt_utc = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        else:
+            dt_utc = datetime.datetime.fromisoformat(ts)
+            if dt_utc.tzinfo is None:
+                dt_utc = dt_utc.replace(tzinfo=datetime.timezone.utc)
+
+        eastern = ZoneInfo("America/New_York")
+        dt_local = dt_utc.astimezone(eastern)
+        now_local = datetime.datetime.now(eastern)
+        diff = now_local - dt_local
     except Exception:
-        return ts  # fallback
+        # If anything goes wrong, just return raw string
+        return ts
 
-    now = datetime.datetime.utcnow()
-    diff = now - dt
-
-    # Today -> show only time
     if diff.days == 0:
-        return dt.strftime("%-I:%M %p")  # e.g. 7:32 PM
-
-    # Within the last week -> day + time
+        # Today -> just time
+        return dt_local.strftime("%-I:%M %p")  # e.g. 7:32 PM
     if diff.days < 7:
-        return dt.strftime("%a %-I:%M %p")  # e.g. Sat 7:32 PM
-
+        # This week -> weekday + time
+        return dt_local.strftime("%a %-I:%M %p")  # e.g. Sat 7:32 PM
     # Older -> date + time
-    return dt.strftime("%b %-d, %-I:%M %p")  # e.g. Nov 15, 7:32 PM
+    return dt_local.strftime("%b %-d, %-I:%M %p")  # e.g. Nov 15, 7:32 PM
 
 
 # -------------------------
@@ -110,10 +120,8 @@ if df.empty:
     st.error("Markets array is empty in Firestore.")
     st.stop()
 
-# Sort by probability descending
 df = df.sort_values("probability", ascending=False, na_position="last")
 
-# Save previous probabilities in session state for deltas
 if "prev_probs" not in st.session_state:
     st.session_state.prev_probs = {}
 
@@ -157,7 +165,6 @@ for _, r in df.iterrows():
         }
     )
 
-# Update state for next refresh
 st.session_state.prev_probs = {
     r["ticker"]: r["probability"] for _, r in df.iterrows()
 }
@@ -180,7 +187,6 @@ for item in ticker_rows:
       </div>
     """
 
-# Duplicate list for seamless scrolling
 track_html = ticker_items_html + ticker_items_html
 
 ticker_html = f"""
