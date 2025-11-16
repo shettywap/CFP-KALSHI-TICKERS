@@ -10,6 +10,13 @@ from google.oauth2 import service_account
 from streamlit_autorefresh import st_autorefresh
 
 # -------------------------
+# CONFIG CONSTANTS
+# -------------------------
+REFRESH_INTERVAL_MS = 15000      # Streamlit auto-refresh interval
+WINDOW_HOURS = 6                 # How far back to compute net change for ticker
+MOVER_DOC_LIMIT = 50             # How many mover docs to pull for that window
+
+# -------------------------
 # PAGE CONFIG
 # -------------------------
 st.set_page_config(
@@ -18,7 +25,7 @@ st.set_page_config(
 )
 
 # -------------------------
-# FIRESTORE CLIENT (CACHED)
+# FIRESTORE CLIENT
 # -------------------------
 @st.cache_resource
 def get_db():
@@ -29,9 +36,9 @@ def get_db():
 db = get_db()
 
 # -------------------------
-# AUTO REFRESH (every 15s)
+# AUTO REFRESH
 # -------------------------
-st_autorefresh(interval=15000, key="auto_refresh_cfp")
+st_autorefresh(interval=REFRESH_INTERVAL_MS, key="auto_refresh_cfp")
 
 # -------------------------
 # HELPERS
@@ -48,19 +55,18 @@ def prob_pct(prob: Optional[float]) -> Optional[float]:
     return None if prob is None else round(prob * 100, 1)
 
 
-def delta_text(delta: Optional[float]) -> str:
+def delta_points_text(delta: Optional[float]) -> str:
+    """Delta in price points (Kalshi ticks), not probability."""
     if delta is None:
         return ""
     if delta == 0:
-        return "0.0%"
+        return "0"
     sign = "+" if delta > 0 else ""
-    return f"{sign}{delta * 100:.1f}%"  # delta in 0–1 scale
+    return f"{sign}{delta:.0f}"
 
 
 def pretty_time(ts: str) -> str:
-    """
-    Convert Firestore UTC timestamp string -> America/New_York readable.
-    """
+    """Convert Firestore UTC timestamp string -> America/New_York readable."""
     try:
         # Handle both "...Z" and plain ISO
         if ts.endswith("Z"):
@@ -84,6 +90,18 @@ def pretty_time(ts: str) -> str:
     return dt_local.strftime("%b %-d, %-I:%M %p")
 
 
+def parse_ts_utc(ts: str) -> Optional[datetime.datetime]:
+    try:
+        if ts.endswith("Z"):
+            return datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        dt = datetime.datetime.fromisoformat(ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
 # -------------------------
 # CACHED FIRESTORE READS
 # -------------------------
@@ -96,10 +114,10 @@ def load_current_markets() -> Optional[Dict]:
 
 
 @st.cache_data(ttl=5)
-def load_recent_movers(limit_docs: int = 5) -> List[Dict]:
+def load_recent_movers_raw(limit_docs: int = MOVER_DOC_LIMIT) -> List[Dict]:
     """
-    Read the last `limit_docs` mover snapshots and flatten to rows.
-    Cached for 5s to drastically reduce Firestore reads.
+    Read the last `limit_docs` mover snapshots, return raw rows
+    with both raw timestamp and ticker so we can aggregate per team.
     """
     docs = (
         db.collection("movers")
@@ -118,7 +136,8 @@ def load_recent_movers(limit_docs: int = 5) -> List[Dict]:
         for item in blob.get("items", []):
             rows.append(
                 {
-                    "time": pretty_time(ts),
+                    "timestamp_raw": ts,
+                    "ticker": item.get("ticker"),
                     "team": team_from_ticker(item.get("ticker")),
                     "old": item.get("old"),
                     "new": item.get("new"),
@@ -126,6 +145,29 @@ def load_recent_movers(limit_docs: int = 5) -> List[Dict]:
                 }
             )
     return rows
+
+
+def compute_net_changes_by_ticker(movers_df: pd.DataFrame, hours: int) -> Dict[str, float]:
+    """
+    From the movers dataframe, compute net change in price for each ticker
+    over the last `hours` hours.
+    """
+    if movers_df.empty:
+        return {}
+
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    cutoff = now_utc - datetime.timedelta(hours=hours)
+
+    movers_df = movers_df.copy()
+    movers_df["ts_dt"] = movers_df["timestamp_raw"].apply(parse_ts_utc)
+    recent = movers_df[movers_df["ts_dt"].notna()]
+    recent = recent[recent["ts_dt"] >= cutoff]
+
+    if recent.empty:
+        return {}
+
+    net = recent.groupby("ticker")["change"].sum().to_dict()
+    return net
 
 
 # -------------------------
@@ -145,30 +187,21 @@ if df.empty:
 
 df = df.sort_values("probability", ascending=False, na_position="last")
 
-if "prev_probs" not in st.session_state:
-    st.session_state.prev_probs = {}
-
 # -------------------------
-# SIDEBAR: TICKER SPEED CONTROL
+# LOAD MOVERS + NET CHANGES
 # -------------------------
-with st.sidebar:
-    scroll_duration = st.slider(
-        "Ticker scroll duration (seconds per loop)",
-        min_value=20,
-        max_value=120,
-        value=50,
-        step=5,
-        help="Higher = slower scroll",
-    )
+mover_rows = load_recent_movers_raw()
+movers_df = pd.DataFrame(mover_rows)
+net_changes = compute_net_changes_by_ticker(movers_df, WINDOW_HOURS)
 
 # -------------------------
 # HEADER
 # -------------------------
 st.title("🏈 CFP Playoff Odds — Live Ticker")
-st.caption("Live probabilities from Kalshi, synced via Firestore.")
+st.caption(f"Live probabilities from Kalshi (net change over last {WINDOW_HOURS}h).")
 
 # -------------------------
-# BUILD TICKER DATA
+# BUILD TICKER DATA (USING NET CHANGES)
 # -------------------------
 ticker_rows: List[Dict] = []
 
@@ -177,16 +210,11 @@ for _, r in df.iterrows():
     team = team_from_ticker(ticker)
     prob = r.get("probability")
 
-    prev = st.session_state.prev_probs.get(ticker)
-    delta = None
-    if prev is not None and prob is not None:
-        delta = prob - prev
+    delta_pts = net_changes.get(ticker, 0.0)
 
-    if delta is None:
-        direction = "flat"
-    elif delta > 0:
+    if delta_pts > 0:
         direction = "up"
-    elif delta < 0:
+    elif delta_pts < 0:
         direction = "down"
     else:
         direction = "flat"
@@ -195,25 +223,21 @@ for _, r in df.iterrows():
         {
             "team": team,
             "prob_text": prob_text(prob),
-            "delta": delta,
-            "delta_text": delta_text(delta),
+            "delta_pts": delta_pts,
+            "delta_text": delta_points_text(delta_pts),
             "direction": direction,
         }
     )
 
-# update for next refresh
-st.session_state.prev_probs = {
-    r["ticker"]: r["probability"] for _, r in df.iterrows()
-}
-
 # -------------------------
-# TICKER HTML (WITH SPEED CONTROL)
+# TICKER HTML
 # -------------------------
 ticker_items_html = ""
 for item in ticker_rows:
     arrow = "▲" if item["direction"] == "up" else "▼" if item["direction"] == "down" else ""
     cls = {"up": "delta-up", "down": "delta-down", "flat": "delta-flat"}[item["direction"]]
 
+    # Example: "TEX 45.0%  ▲ +8"
     ticker_items_html += f"""
       <div class="ticker-item">
         <span class="ticker-team">{item['team']}</span>
@@ -237,7 +261,7 @@ body {{ margin:0; padding:0; }}
 }}
 .ticker-track {{
   display:inline-flex; white-space:nowrap;
-  animation:scroll {scroll_duration}s linear infinite;
+  animation:scroll 25s linear infinite;
 }}
 @keyframes scroll {{
   from {{ transform:translateX(0%); }}
@@ -277,21 +301,22 @@ st.markdown("### 📈 Live Ticker")
 components.html(ticker_html, height=70, scrolling=False)
 
 # ============================================================
-# 🔥 RECENT MOVERS (CACHED, COLOR-CODED)
+# 🔥 RECENT MOVERS (TABLE)
 # ============================================================
 st.markdown("### 🔥 Recent Movers")
 
-mover_rows = load_recent_movers(limit_docs=5)
-movers_df = pd.DataFrame(mover_rows)
-
 if movers_df.empty:
-    st.info("No movers yet.")
+    st.info("No movers recorded yet.")
 else:
+    movers_df = movers_df.copy()
+    movers_df["time"] = movers_df["timestamp_raw"].apply(pretty_time)
     movers_df["direction"] = movers_df["change"].apply(
         lambda x: "🟢 UP" if x > 0 else ("🔴 DOWN" if x < 0 else "⚪ FLAT")
     )
+
+    display_movers = movers_df[["time", "team", "old", "new", "change", "direction"]]
     st.dataframe(
-        movers_df[["time", "team", "old", "new", "change", "direction"]],
+        display_movers,
         hide_index=True,
         use_container_width=True,
     )
