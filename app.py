@@ -13,7 +13,7 @@ from streamlit_autorefresh import st_autorefresh
 # CONFIG CONSTANTS
 # -------------------------
 REFRESH_INTERVAL_MS = 15000      # Streamlit auto-refresh interval
-WINDOW_HOURS = 6                 # How far back to compute net change for ticker
+WINDOW_HOURS = 3                 # How far back to compute net change for ticker
 MOVER_DOC_LIMIT = 50             # How many mover docs to pull for that window
 
 # -------------------------
