@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 from google.oauth2 import service_account
 from google.cloud import firestore
@@ -23,7 +24,7 @@ def get_db():
 
 db = get_db()
 
-# auto-refresh every 5 seconds
+# auto-refresh every 5s
 st_autorefresh(interval=5000, key="cfp_ticker_refresh")
 
 # -------------------------
@@ -48,7 +49,7 @@ def delta_text(delta):
     if delta is None or delta == 0:
         return "0.0%"
     sign = "+" if delta > 0 else ""
-    return f"{sign}{delta * 100:.1f}%"  # delta is still 0–1 scale
+    return f"{sign}{delta * 100:.1f}%"  # delta still in 0–1 scale
 
 # -------------------------
 # FETCH CURRENT MARKETS
@@ -71,84 +72,20 @@ if df.empty:
 # sort by probability
 df = df.sort_values(by="probability", ascending=False, na_position="last")
 
-# previous probabilities for deltas
+# previous probs for deltas
 if "prev_probs" not in st.session_state:
     st.session_state.prev_probs = {}
 
 # -------------------------
-# BASIC STYLING
+# MAIN PAGE HEADER
 # -------------------------
-st.markdown(
-    """
-<style>
-body {
-    background: radial-gradient(circle at top, #0f172a, #020617 60%);
-}
-.main {
-    padding-top: 1rem;
-}
-
-/* Ticker */
-.ticker-wrapper {
-    width: 100%;
-    overflow: hidden;
-    background: #020617;
-    border-radius: 16px;
-    padding: 8px 0;
-    border: 1px solid rgba(148, 163, 184, 0.4);
-    box-shadow: 0 10px 25px rgba(15, 23, 42, 0.85);
-}
-.ticker {
-    display: inline-block;
-    white-space: nowrap !important;
-    animation: ticker-scroll 35s linear infinite;
-}
-@keyframes ticker-scroll {
-    from { transform: translateX(0%); }
-    to { transform: translateX(-50%); }
-}
-.ticker-item {
-    display: inline-flex;
-    align-items: baseline;
-    gap: 6px;
-    padding: 4px 10px;
-    margin-right: 20px;
-    border-radius: 999px;
-    background: rgba(15, 23, 42, 0.9);
-    border: 1px solid rgba(148, 163, 184, 0.4);
-    font-size: 0.9rem;
-}
-.ticker-team {
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    font-weight: 600;
-    color: #f9fafb;
-}
-.ticker-prob {
-    font-variant-numeric: tabular-nums;
-    color: #a5b4fc;
-}
-.ticker-delta {
-    font-variant-numeric: tabular-nums;
-    font-size: 0.8rem;
-}
-.delta-up { color: #22c55e; }
-.delta-down { color: #ef4444; }
-.delta-flat { color: #9ca3af; }
-
-/* tables */
-.block-container {
-    padding-top: 1.5rem;
-}
-</style>
-""",
-    unsafe_allow_html=True,
-)
+st.title("🏈 CFP Playoff Odds — Live Ticker")
+st.caption("Live probabilities from Kalshi, synced via Firestore.")
 
 # -------------------------
-# BUILD TICKER HTML
+# BUILD DATA STRUCTURE FOR TICKER
 # -------------------------
-ticker_html = '<div class="ticker-wrapper"><div class="ticker">'
+ticker_rows = []
 
 for _, row in df.iterrows():
     ticker = row.get("ticker")
@@ -157,36 +94,24 @@ for _, row in df.iterrows():
 
     prev_prob = st.session_state.prev_probs.get(ticker)
     delta = None
-    delta_class = "delta-flat"
-
+    direction = "flat"
     if prev_prob is not None and prob is not None:
         delta = prob - prev_prob
         if delta > 0:
-            delta_class = "delta-up"
+            direction = "up"
         elif delta < 0:
-            delta_class = "delta-down"
+            direction = "down"
 
-    p_text = prob_text(prob)
-    d_text = delta_text(delta) if delta is not None else ""
-
-    # add up/down arrow
-    if delta is not None and delta != 0:
-        if delta > 0:
-            d_text = "▲ " + d_text
-        else:
-            d_text = "▼ " + d_text
-
-    ticker_html += f"""
-        <span class="ticker-item">
-            <span class="ticker-team">{team}</span>
-            <span class="ticker-prob">{p_text}</span>
-            <span class="ticker-delta {delta_class}">{d_text}</span>
-        </span>
-    """
-
-# duplicate for continuous scroll
-ticker_html += ticker_html
-ticker_html += "</div></div>"
+    ticker_rows.append(
+        {
+            "team": team,
+            "prob": prob,
+            "prob_text": prob_text(prob),
+            "delta": delta,
+            "delta_text": delta_text(delta) if delta is not None else "",
+            "direction": direction,
+        }
+    )
 
 # store current probs for next refresh
 st.session_state.prev_probs = {
@@ -194,16 +119,112 @@ st.session_state.prev_probs = {
 }
 
 # -------------------------
-# LAYOUT
+# TICKER COMPONENT (HTML)
 # -------------------------
-st.title("🏈 CFP Playoff Odds — Live Ticker")
-st.caption("Live probabilities from Kalshi, synced via Firestore.")
+ticker_items_html = ""
+for item in ticker_rows:
+    dir_cls = {
+        "up": "delta-up",
+        "down": "delta-down",
+        "flat": "delta-flat",
+    }.get(item["direction"], "delta-flat")
+
+    delta_display = ""
+    if item["delta"] is not None and item["delta"] != 0:
+        arrow = "▲" if item["delta"] > 0 else "▼"
+        delta_display = f"{arrow} {item['delta_text']}"
+    else:
+        delta_display = item["delta_text"]
+
+    ticker_items_html += f"""
+      <div class="ticker-item">
+        <span class="ticker-team">{item['team']}</span>
+        <span class="ticker-prob">{item['prob_text']}</span>
+        <span class="ticker-delta {dir_cls}">{delta_display}</span>
+      </div>
+    """
+
+# duplicate for seamless scroll
+ticker_track_html = ticker_items_html + ticker_items_html
+
+ticker_html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+body {{
+  margin: 0;
+  padding: 0;
+}}
+.ticker-wrapper {{
+  width: 100%;
+  overflow: hidden;
+  background: #020617;
+  border-radius: 14px;
+  border: 1px solid rgba(148, 163, 184, 0.5);
+  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.9);
+}}
+.ticker-inner {{
+  white-space: nowrap;
+}}
+.ticker-track {{
+  display: inline-flex;
+  white-space: nowrap;
+  animation: ticker-scroll 35s linear infinite;
+}}
+@keyframes ticker-scroll {{
+  from {{ transform: translateX(0%); }}
+  to   {{ transform: translateX(-50%); }}
+}}
+.ticker-item {{
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 4px 12px;
+  margin-right: 20px;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.95);
+  border: 1px solid rgba(148, 163, 184, 0.45);
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 0.9rem;
+}}
+.ticker-team {{
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 600;
+  color: #f9fafb;
+}}
+.ticker-prob {{
+  font-variant-numeric: tabular-nums;
+  color: #a5b4fc;
+}}
+.ticker-delta {{
+  font-variant-numeric: tabular-nums;
+  font-size: 0.8rem;
+}}
+.delta-up {{ color: #22c55e; }}
+.delta-down {{ color: #ef4444; }}
+.delta-flat {{ color: #9ca3af; }}
+</style>
+</head>
+<body>
+  <div class="ticker-wrapper">
+    <div class="ticker-inner">
+      <div class="ticker-track">
+        {ticker_track_html}
+      </div>
+    </div>
+  </div>
+</body>
+</html>
+"""
 
 st.markdown("### Live Ticker")
-st.markdown(ticker_html, unsafe_allow_html=True)
+components.html(ticker_html, height=70, scrolling=False)
 
 # -------------------------
-# CLEAN PRICES TABLE
+# CURRENT PRICES TABLE
 # -------------------------
 st.markdown("### Current Prices")
 
@@ -211,7 +232,6 @@ prices_df = df.copy()
 prices_df["team"] = prices_df["ticker"].apply(team_from_ticker)
 prices_df["probability (%)"] = prices_df["probability"].apply(prob_pct)
 
-# choose a single price column (yes_price preferred, else last_price)
 def pick_price(row):
     if pd.notna(row.get("yes_price")):
         return row.get("yes_price")
@@ -271,10 +291,10 @@ if movers_df.empty:
     st.info("No movers recorded yet.")
 else:
     movers_df["team"] = movers_df["ticker"].apply(team_from_ticker)
+    movers_df["change (pts)"] = movers_df["change"]
     movers_df["direction"] = movers_df["change"].apply(
         lambda x: "up" if x is not None and x > 0 else ("down" if x is not None and x < 0 else "flat")
     )
-    movers_df["change (pts)"] = movers_df["change"]
 
     display_movers = movers_df[
         ["timestamp", "team", "ticker", "old", "new", "change (pts)", "direction"]
