@@ -1,5 +1,6 @@
 import datetime
 from zoneinfo import ZoneInfo
+from typing import Optional, List, Dict
 
 import pandas as pd
 import streamlit as st
@@ -27,8 +28,11 @@ def get_db():
 
 db = get_db()
 
-# AUTO REFRESH (5 seconds)
-st_autorefresh(interval=5000, key="auto_refresh_cfp")
+# -------------------------
+# AUTO REFRESH (every 15s)
+# -------------------------
+# This plus caching drastically reduces Firestore reads
+st_autorefresh(interval=15000, key="auto_refresh_cfp")
 
 # -------------------------
 # HELPERS
@@ -36,25 +40,30 @@ st_autorefresh(interval=5000, key="auto_refresh_cfp")
 def team_from_ticker(ticker: str) -> str:
     return ticker.split("-")[-1] if ticker else ""
 
-def prob_text(prob: float | None) -> str:
-    return "--" if prob is None else f"{prob*100:.1f}%"
 
-def prob_pct(prob: float | None) -> float | None:
+def prob_text(prob: Optional[float]) -> str:
+    return "--" if prob is None else f"{prob * 100:.1f}%"
+
+
+def prob_pct(prob: Optional[float]) -> Optional[float]:
     return None if prob is None else round(prob * 100, 1)
 
-def delta_text(delta: float | None) -> str:
+
+def delta_text(delta: Optional[float]) -> str:
     if delta is None:
         return ""
     if delta == 0:
         return "0.0%"
     sign = "+" if delta > 0 else ""
-    return f"{sign}{delta * 100:.1f}%"
+    return f"{sign}{delta * 100:.1f}%"  # delta in 0–1 scale
 
 
 def pretty_time(ts: str) -> str:
-    """Convert Firestore UTC timestamp → local EST readable format."""
+    """
+    Convert Firestore UTC timestamp string -> America/New_York readable.
+    """
     try:
-        # Ensure timezone exists
+        # Handle both "...Z" and plain ISO
         if ts.endswith("Z"):
             dt_utc = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
         else:
@@ -77,16 +86,65 @@ def pretty_time(ts: str) -> str:
 
 
 # -------------------------
+# CACHED FIRESTORE READS
+# -------------------------
+@st.cache_data(ttl=5)
+def load_current_markets() -> Optional[Dict]:
+    doc = db.collection("cfp_markets").document("current").get()
+    if not doc.exists:
+        return None
+    return doc.to_dict() or {}
+
+
+@st.cache_data(ttl=5)
+def load_recent_movers(limit_docs: int = 5) -> List[Dict]:
+    """
+    Read the last `limit_docs` mover snapshots and flatten to rows.
+    Cached for 5s to drastically reduce Firestore reads.
+    """
+    docs = (
+        db.collection("movers")
+        .order_by("timestamp", direction=firestore.Query.DESCENDING)
+        .limit(limit_docs)
+        .stream()
+    )
+
+    rows: List[Dict] = []
+    for d in docs:
+        blob = d.to_dict() or {}
+        ts = blob.get("timestamp")
+        if not ts:
+            continue
+
+        for item in blob.get("items", []):
+            rows.append(
+                {
+                    "time": pretty_time(ts),
+                    "team": team_from_ticker(item.get("ticker")),
+                    "old": item.get("old"),
+                    "new": item.get("new"),
+                    "change": item.get("change"),
+                }
+            )
+    return rows
+
+
+# -------------------------
 # LOAD CURRENT MARKETS
 # -------------------------
-doc = db.collection("cfp_markets").document("current").get()
-if not doc.exists:
-    st.error("No data found in Firestore.")
+payload = load_current_markets()
+if not payload:
+    st.error("No data found in Firestore at cfp_markets/current.")
     st.stop()
 
-payload = doc.to_dict()
 markets = payload.get("markets", [])
-df = pd.DataFrame(markets).sort_values("probability", ascending=False)
+df = pd.DataFrame(markets)
+
+if df.empty:
+    st.error("Markets array is empty in Firestore.")
+    st.stop()
+
+df = df.sort_values("probability", ascending=False, na_position="last")
 
 if "prev_probs" not in st.session_state:
     st.session_state.prev_probs = {}
@@ -97,17 +155,21 @@ if "prev_probs" not in st.session_state:
 st.title("🏈 CFP Playoff Odds — Live Ticker")
 st.caption("Live probabilities from Kalshi, synced via Firestore.")
 
+
 # -------------------------
 # BUILD TICKER DATA
 # -------------------------
-ticker_rows = []
+ticker_rows: List[Dict] = []
+
 for _, r in df.iterrows():
-    ticker = r["ticker"]
+    ticker = r.get("ticker")
     team = team_from_ticker(ticker)
-    prob = r["probability"]
+    prob = r.get("probability")
 
     prev = st.session_state.prev_probs.get(ticker)
-    delta = prob - prev if prev is not None else None
+    delta = None
+    if prev is not None and prob is not None:
+        delta = prob - prev
 
     if delta is None:
         direction = "flat"
@@ -118,14 +180,17 @@ for _, r in df.iterrows():
     else:
         direction = "flat"
 
-    ticker_rows.append({
-        "team": team,
-        "prob_text": prob_text(prob),
-        "delta": delta,
-        "delta_text": delta_text(delta),
-        "direction": direction,
-    })
+    ticker_rows.append(
+        {
+            "team": team,
+            "prob_text": prob_text(prob),
+            "delta": delta,
+            "delta_text": delta_text(delta),
+            "direction": direction,
+        }
+    )
 
+# update for next refresh
 st.session_state.prev_probs = {
     r["ticker"]: r["probability"] for _, r in df.iterrows()
 }
@@ -157,6 +222,7 @@ body {{ margin:0; padding:0; }}
   width: 100%; background:#020617; overflow:hidden;
   border-radius:16px; padding:8px 0;
   border:1px solid rgba(148,163,184,0.5);
+  box-shadow:0 10px 24px rgba(15,23,42,0.9);
 }}
 .ticker-track {{
   display:inline-flex; white-space:nowrap;
@@ -173,10 +239,17 @@ body {{ margin:0; padding:0; }}
   background:rgba(255,255,255,0.06);
   font-family:sans-serif; font-size:0.9rem;
 }}
-.ticker-team {{ color:#fff; font-weight:600; text-transform:uppercase; }}
-.ticker-prob {{ color:#a5b4fc; font-variant-numeric:tabular-nums; }}
-.ticker-delta {{ font-size:0.8rem; font-variant-numeric:tabular-nums; }}
-.delta-up {{ color:#22c55e; }}
+.ticker-team {{
+  color:#fff; font-weight:600; text-transform:uppercase;
+  letter-spacing:0.07em;
+}}
+.ticker-prob {{
+  color:#a5b4fc; font-variant-numeric:tabular-nums;
+}}
+.ticker-delta {{
+  font-size:0.8rem; font-variant-numeric:tabular-nums;
+}}
+.delta-up   {{ color:#22c55e; }}
 .delta-down {{ color:#ef4444; }}
 .delta-flat {{ color:#94a3b8; }}
 </style>
@@ -193,34 +266,12 @@ st.markdown("### 📈 Live Ticker")
 components.html(ticker_html, height=70, scrolling=False)
 
 # ============================================================
-# 🔥 RECENT MOVERS
+# 🔥 RECENT MOVERS (CACHED, COLOR-CODED)
 # ============================================================
 st.markdown("### 🔥 Recent Movers")
 
-def load_recent_movers(limit_docs=10):
-    docs = (
-        db.collection("movers")
-        .order_by("timestamp", direction=firestore.Query.DESCENDING)
-        .limit(limit_docs)
-        .stream()
-    )
-
-    rows = []
-    for d in docs:
-        blob = d.to_dict() or {}
-        ts = blob.get("timestamp")
-
-        for m in blob.get("items", []):
-            rows.append({
-                "time": pretty_time(ts),
-                "team": team_from_ticker(m["ticker"]),
-                "old": m["old"],
-                "new": m["new"],
-                "change": m["change"],
-            })
-    return pd.DataFrame(rows)
-
-movers_df = load_recent_movers()
+mover_rows = load_recent_movers(limit_docs=5)
+movers_df = pd.DataFrame(mover_rows)
 
 if movers_df.empty:
     st.info("No movers yet.")
@@ -235,12 +286,14 @@ else:
     )
 
 # ============================================================
-# 📊 CURRENT PRICES
+# 📊 CURRENT PRICES (CLEAN TABLE)
 # ============================================================
 st.markdown("### 📊 Current Prices")
 
-def pick_price(r):
-    return r["yes_price"] if pd.notna(r.get("yes_price")) else r["last_price"]
+def pick_price(row: pd.Series):
+    if pd.notna(row.get("yes_price")):
+        return row.get("yes_price")
+    return row.get("last_price")
 
 df_prices = df.copy()
 df_prices["team"] = df_prices["ticker"].apply(team_from_ticker)
