@@ -18,7 +18,7 @@ st.set_page_config(
 )
 
 # -------------------------
-# FIRESTORE CLIENT
+# FIRESTORE CLIENT (CACHED)
 # -------------------------
 @st.cache_resource
 def get_db():
@@ -31,7 +31,6 @@ db = get_db()
 # -------------------------
 # AUTO REFRESH (every 15s)
 # -------------------------
-# This plus caching drastically reduces Firestore reads
 st_autorefresh(interval=15000, key="auto_refresh_cfp")
 
 # -------------------------
@@ -150,11 +149,23 @@ if "prev_probs" not in st.session_state:
     st.session_state.prev_probs = {}
 
 # -------------------------
+# SIDEBAR: TICKER SPEED CONTROL
+# -------------------------
+with st.sidebar:
+    scroll_duration = st.slider(
+        "Ticker scroll duration (seconds per loop)",
+        min_value=20,
+        max_value=120,
+        value=50,
+        step=5,
+        help="Higher = slower scroll",
+    )
+
+# -------------------------
 # HEADER
 # -------------------------
 st.title("🏈 CFP Playoff Odds — Live Ticker")
 st.caption("Live probabilities from Kalshi, synced via Firestore.")
-
 
 # -------------------------
 # BUILD TICKER DATA
@@ -196,7 +207,7 @@ st.session_state.prev_probs = {
 }
 
 # -------------------------
-# TICKER HTML
+# TICKER HTML (WITH SPEED CONTROL)
 # -------------------------
 ticker_items_html = ""
 for item in ticker_rows:
@@ -226,7 +237,7 @@ body {{ margin:0; padding:0; }}
 }}
 .ticker-track {{
   display:inline-flex; white-space:nowrap;
-  animation:scroll 25s linear infinite;
+  animation:scroll {scroll_duration}s linear infinite;
 }}
 @keyframes scroll {{
   from {{ transform:translateX(0%); }}
