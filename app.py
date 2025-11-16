@@ -261,7 +261,7 @@ body {{ margin:0; padding:0; }}
 }}
 .ticker-track {{
   display:inline-flex; white-space:nowrap;
-  animation:scroll 25s linear infinite;
+  animation:scroll 50s linear infinite;
 }}
 @keyframes scroll {{
   from {{ transform:translateX(0%); }}
